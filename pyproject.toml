@@ -1,0 +1,29 @@
+# maturin develop
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ptpyrs"
+version = "0.1.0"
+classifiers = []
+requires-python = ">=3.7"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+ptpyrs = "ptpyrs.__main__:ptpyrs.main"
+
+[tool.maturin]
+# include = [
+# #   { path = "path/**/*", format = "sdist" },
+# #   { path = "all", format = ["sdist", "wheel"] },
+# #   { path = "for/wheel/**/*", format = "wheel" }
+# ]
+exclude = ["src/*", "Cargo.toml", "Cargo.lock"]
+# Build artifacts with the specified Cargo profile
+# profile = "release"
+# List of features to activate
+# features = ["dev"]
+features = ["pyo3/extension-module"]

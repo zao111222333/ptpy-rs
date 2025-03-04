@@ -1,0 +1,24 @@
+[package]
+name = "ptpyrs"
+version = "0.1.0"
+edition = "2024"
+
+
+[features]
+default = []
+dev = []
+
+[lib]
+name = "ptpyrs"
+crate-type = ["cdylib", "rlib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+pyo3 = { version = "0.23.4", features = ["multiple-pymethods", "abi3-py37", "indexmap"] }
+thiserror = "2.0"
+rustyline = { git = "https://github.com/zao111222333/rustyline.git", branch = "highlight", features = ["custom-bindings"] }
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff.git" }
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff.git" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff.git" }
+anstyle = "1.0.8"
