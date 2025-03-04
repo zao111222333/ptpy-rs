@@ -344,7 +344,7 @@ impl Highlighter for MyHelper {
                     }
                     TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace => {
                         bracket_level -= 1;
-                        
+
                         Style::new().fg_color(Some(
                             TryInto::<usize>::try_into(bracket_level)
                                 .map_or(UNKNOWN_COLOR, |level| {
