@@ -71,7 +71,6 @@ impl fmt::Display for ExitCode {
 }
 
 #[derive(Error, Debug)]
-#[expect(variant_size_differences)]
 pub(super) enum ExecErr {
     #[error("Exit {0}")]
     Exit(#[from] ExitCode),
