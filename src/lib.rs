@@ -1,11 +1,18 @@
 mod args;
 mod shell;
-
+extern crate alloc;
 use anstyle::{AnsiColor, Color, RgbColor};
 use pyo3::prelude::*;
 const TERMINATE_N: u8 = 2;
 const PROMPT1: &str = "ptpy > ";
-const PROMPT2: &str = " ... > ";
+const PROMPT2: &str = "\n ... > ";
+const INIT_CMDS: &str = "import os\nimport sys";
+const MSG: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    " ",
+    env!("CARGO_PKG_VERSION"),
+    " by Junzhuo"
+);
 const PROMPT1_OK: &str = "\x1b[1m\x1b[38;5;39mptpy\x1b[1;32m > \x1b[m";
 const PROMPT1_ERR: &str = "\x1b[1m\x1b[38;5;39mptpy\x1b[1;91m > \x1b[m";
 const PROMPT2_OK: &str = "\n\x1b[1m\x1b[38;5;39m ...\x1b[1;32m > \x1b[m";

@@ -5,7 +5,6 @@ build-backend = "maturin"
 
 [project]
 name = "ptpyrs"
-version = "0.1.2"
 classifiers = []
 requires-python = ">=3.7"
 

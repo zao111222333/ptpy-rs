@@ -1,10 +1,11 @@
 use super::{
     BLANK_COLOR, BRACKET_COLORS, CLASS_COLOR, COMMENT_COLOR, FUNCTION_COLOR, INFORM_ERR_COLOR,
-    KEY1_COLOR, KEY2_COLOR, PROMPT1, PROMPT1_ERR, PROMPT1_OK, PROMPT2, PROMPT2_OK, STRING_COLOR,
-    SYMBOL_COLOR, TERMINATE_N, UNKNOWN_COLOR, args,
+    INIT_CMDS, KEY1_COLOR, KEY2_COLOR, MSG, PROMPT1, PROMPT1_ERR, PROMPT1_OK, PROMPT2, PROMPT2_OK,
+    STRING_COLOR, SYMBOL_COLOR, TERMINATE_N, UNKNOWN_COLOR, args,
 };
+use alloc::ffi::CString;
 use anstyle::{AnsiColor, Style};
-use core::{fmt, iter::once, marker::PhantomData};
+use core::{fmt, iter::once, marker::PhantomData, ops::Range};
 use pyo3::{
     exceptions::{PyBaseException, PySystemExit},
     prelude::*,
@@ -16,7 +17,7 @@ use ruff_python_parser::{
 };
 use ruff_text_size::{Ranged, TextRange};
 use rustyline::{
-    Cmd, Editor, EventHandler, Helper, KeyCode, KeyEvent, Modifiers, Movement,
+    Cmd, Editor, EventHandler, Helper, KeyCode, KeyEvent, Modifiers, Movement, Parser,
     completion::Completer,
     error::ReadlineError,
     highlight::{DisplayOnce, Highlighter, Style as _, StyledBlocks},
@@ -24,16 +25,16 @@ use rustyline::{
     history::DefaultHistory,
     validate::{ValidationContext, ValidationResult, Validator},
 };
-use std::{ffi::CString, fs::File, io::Read, path::PathBuf};
+use std::{fs::File, io::Read, path::PathBuf};
 use thiserror::Error;
 
 #[inline]
 pub(super) fn run(py: Python<'_>, args: args::Args) -> ExitMsg {
     match args.mode {
         args::Mode::InteractiveShell => {
-            println!("ptpyrs {} | packaged by Junzhuo", env!("CARGO_PKG_VERSION"));
+            println!("{MSG}");
             ExitMsg {
-                inner: run_shell(py, vec![]),
+                inner: run_shell(py, INIT_CMDS),
                 path: None,
             }
         }
@@ -71,6 +72,7 @@ impl fmt::Display for ExitCode {
 }
 
 #[derive(Error, Debug)]
+#[expect(variant_size_differences)]
 pub(super) enum ExecErr {
     #[error("Exit {0}")]
     Exit(#[from] ExitCode),
@@ -121,6 +123,7 @@ impl ExitMsg {
 }
 
 struct MyHelper {
+    segments: Vec<(bool, Range<usize>)>,
     parsed: Parsed<Mod>,
     bracket_level_diff: i32,
     need_render: bool,
@@ -132,6 +135,7 @@ impl MyHelper {
     #[inline]
     fn new() -> Self {
         Self {
+            segments: Vec::new(),
             parsed: parse_unchecked("", Mode::Module.into()),
             exec_error: false,
             need_render: true,
@@ -140,14 +144,76 @@ impl MyHelper {
         }
     }
 }
-
+#[inline]
+fn segments(parsed: &Parsed<Mod>) -> Vec<(bool, Range<usize>)> {
+    if parsed.tokens().is_empty() {
+        return vec![(false, 0..0)];
+    }
+    match parsed.syntax() {
+        Mod::Module(module) => {
+            let mut sat_ranges = module.body.iter().map(|body| {
+                (
+                    matches!(body, Stmt::Expr(_)),
+                    <_ as Into<Range<usize>>>::into(body.range()),
+                )
+            });
+            let mut sat_range = sat_ranges.next();
+            let mut block_start = 0;
+            parsed
+                .tokens()
+                .iter()
+                .filter_map(|token| match token.kind() {
+                    TokenKind::Newline | TokenKind::NonLogicalNewline => {
+                        Some(<_ as Into<Range<usize>>>::into(token.range()))
+                    }
+                    _ => None,
+                })
+                .chain(parsed.tokens().last().and_then(|last| {
+                    if last.kind().eq(&TokenKind::Comment) {
+                        let last_idx = last.end().to_usize();
+                        Some(last_idx..last_idx)
+                    } else {
+                        None
+                    }
+                }))
+                .filter_map(|newline_range| {
+                    if let Some((is_expr, _sat_range)) = &sat_range {
+                        if newline_range.start >= _sat_range.end {
+                            let is_expr = *is_expr;
+                            let range = block_start..newline_range.start;
+                            sat_range = sat_ranges.next();
+                            block_start = newline_range.end;
+                            Some((is_expr, range))
+                        } else if newline_range.end <= _sat_range.start {
+                            let range = block_start..newline_range.start;
+                            block_start = newline_range.end;
+                            Some((false, range))
+                        } else {
+                            None
+                        }
+                    } else {
+                        let range = block_start..newline_range.start;
+                        block_start = newline_range.end;
+                        Some((false, range))
+                    }
+                })
+                .collect()
+        }
+        Mod::Expression(expr) => vec![(true, expr.range.into())],
+    }
+}
+impl Parser for MyHelper {
+    fn segments(&mut self) -> &mut Vec<(bool, Range<usize>)> {
+        &mut self.segments
+    }
+}
 impl Helper for MyHelper {
     #[inline]
-    fn update_after_edit(&mut self, line: &str, _pos: usize, _forced_refresh: bool) {
+    fn update_after_edit(&mut self, lines: &str, _pos: usize, _forced_refresh: bool) {
         self.need_render = true;
-        self.parsed = parse_unchecked(line, Mode::Module.into());
+        let parsed = parse_unchecked(lines, Mode::Module.into());
         self.bracket_level_diff =
-            self.parsed
+            parsed
                 .tokens()
                 .iter()
                 .fold(0, |level, token| match token.kind() {
@@ -156,7 +222,7 @@ impl Helper for MyHelper {
                     _ => level,
                 });
         self.parse_error = None;
-        for error in self.parsed.errors() {
+        for error in parsed.errors() {
             match &error.error {
                 ParseErrorType::OtherError(s) => {
                     if s.starts_with("Expected an indented") {
@@ -174,10 +240,19 @@ impl Helper for MyHelper {
                 }
             }
         }
+        let seg = self.segments();
+        seg.clear();
+        let segments = segments(&parsed);
+        let multi_input = segments.len() > 1;
+        seg.extend(segments.into_iter().rev());
+        if multi_input {
+            seg.push((false, 0..0));
+        }
+        self.parsed = parsed;
     }
     #[inline]
     fn continuation_prompt_width<'b, 's: 'b, 'p: 'b>(&'s self, _prompt: &'p str) -> usize {
-        7
+        PROMPT1.len()
     }
 }
 
@@ -189,8 +264,8 @@ impl Validator for MyHelper {
     ) -> rustyline::Result<ValidationResult> {
         let mut indent = self.bracket_level_diff.try_into().unwrap_or(0);
         let mut incomplete = false;
-        let tokens_rev = self.parsed.tokens().iter().rev();
-        for token in tokens_rev {
+        let mut tokens_rev = self.parsed.tokens().iter().rev();
+        while let Some(token) = tokens_rev.next() {
             let (kind, range) = token.as_tuple();
             match kind {
                 TokenKind::Dedent => {
@@ -226,13 +301,15 @@ impl Validator for MyHelper {
         }
         if incomplete {
             Ok(ValidationResult::Incomplete(indent * 2))
-        } else if let Some(parse_error) = &self.parse_error {
-            Ok(ValidationResult::Invalid(Some(format!(
-                "\nSyntaxError: {}",
-                parse_error.error,
-            ))))
         } else {
-            Ok(ValidationResult::Valid(None))
+            if let Some(parse_error) = &self.parse_error {
+                Ok(ValidationResult::Invalid(Some(format!(
+                    "\nSyntaxError: {}",
+                    parse_error.error,
+                ))))
+            } else {
+                Ok(ValidationResult::Valid(None))
+            }
         }
     }
 }
@@ -277,29 +354,34 @@ impl Highlighter for MyHelper {
         line: &'l str,
         _pos: usize,
     ) -> impl 'b + DisplayOnce {
-        self.need_render = false;
+        let segment = self.segments().last().unwrap().1.clone();
+        let after_segment = &line[(segment.end - segment.start)..];
+        if segment.end == line.len() {
+            self.need_render = false;
+        }
         let tokens = self.parsed.tokens();
         let bracket_level_diff = self.bracket_level_diff;
         let error_location = self.parse_error.as_ref().map(|e| e.location);
+        let segment = TextRange::new((segment.start as u32).into(), (segment.end as u32).into());
+
         let mut last_end = 0;
         let mut bracket_level: i32 = 0;
         let mut last_kind = TokenKind::Name;
         let iter = tokens
             .iter()
             .enumerate()
-            .filter_map(|(idx, token)| {
+            .filter_map(move |(idx, token)| {
                 let (kind, range) = token.as_tuple();
-                if range.len().to_u32() == 0 {
+                if range.len().to_u32() == 0 || !segment.contains_range(range) {
                     None
                 } else {
-                    Some((idx, kind, range))
+                    Some((
+                        idx,
+                        kind,
+                        range.sub_start(segment.start()).sub_end(segment.start()),
+                    ))
                 }
             })
-            .chain(once((
-                0,
-                TokenKind::EndOfFile,
-                TextRange::new((line.len() as u32).into(), (line.len() as u32).into()),
-            )))
             .flat_map(move |(idx, kind, range)| {
                 let term = match kind {
                     TokenKind::Newline | TokenKind::NonLogicalNewline => PROMPT2_OK,
@@ -314,15 +396,17 @@ impl Highlighter for MyHelper {
                             _ => {
                                 if term.chars().all(|c| c.is_ascii_uppercase()) {
                                     Style::new().fg_color(Some(KEY1_COLOR))
-                                } else if let Some(next_token) = tokens.get(idx + 1) {
-                                    match next_token.kind() {
-                                        TokenKind::Lpar => {
-                                            Style::new().fg_color(Some(FUNCTION_COLOR))
-                                        }
-                                        _ => Style::new().fg_color(Some(BLANK_COLOR)),
-                                    }
                                 } else {
-                                    Style::new().fg_color(Some(BLANK_COLOR))
+                                    if let Some(next_token) = tokens.get(idx + 1) {
+                                        match next_token.kind() {
+                                            TokenKind::Lpar => {
+                                                Style::new().fg_color(Some(FUNCTION_COLOR))
+                                            }
+                                            _ => Style::new().fg_color(Some(BLANK_COLOR)),
+                                        }
+                                    } else {
+                                        Style::new().fg_color(Some(BLANK_COLOR))
+                                    }
                                 }
                             }
                         },
@@ -343,13 +427,13 @@ impl Highlighter for MyHelper {
                     }
                     TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace => {
                         bracket_level -= 1;
-
-                        Style::new().fg_color(Some(
+                        let style = Style::new().fg_color(Some(
                             TryInto::<usize>::try_into(bracket_level)
                                 .map_or(UNKNOWN_COLOR, |level| {
                                     BRACKET_COLORS[level % BRACKET_COLORS.len()]
                                 }),
-                        ))
+                        ));
+                        style
                     }
                     TokenKind::From
                     | TokenKind::Import
@@ -460,7 +544,16 @@ impl Highlighter for MyHelper {
                     .chain(once((style, term)));
                 last_end = range.end().to_usize();
                 out
-            });
+            })
+            .chain({
+                let mut v: Vec<_> = after_segment
+                    .split('\n')
+                    .flat_map(|s| [(Style::new(), s), (Style::new(), PROMPT2)])
+                    .collect();
+                _ = v.pop();
+                v
+            })
+            .filter(|(_, term)| !term.is_empty());
         StyledBlocks::new(iter)
     }
     #[inline]
@@ -487,7 +580,7 @@ impl Highlighter for MyHelper {
             parse_error: &'e Option<ParseError>,
             _marker: PhantomData<&'l ()>,
         }
-        impl DisplayOnce for Lines<'_, '_> {
+        impl<'l, 'e> DisplayOnce for Lines<'l, 'e> {
             fn fmt<W: fmt::Write>(self, f: &mut W) -> fmt::Result {
                 if let Some(parse_error) = self.parse_error.as_ref() {
                     if self.s.starts_with("\nSyntaxError") {
@@ -498,7 +591,8 @@ impl Highlighter for MyHelper {
                 if let Some(first_line) = iter.next() {
                     write!(f, "{}", self.style.start())?;
                     write!(f, "{}", first_line)?;
-                    iter.try_for_each(|line| write!(f, "\n{}{}", PROMPT2, line))?;
+                    iter.map(|line| write!(f, "{}{}", PROMPT2, line))
+                        .collect::<fmt::Result>()?;
                     write!(f, "{}", self.style.end())
                 } else {
                     write!(f, "{}", self.style.end())
@@ -517,7 +611,7 @@ impl Highlighter for MyHelper {
 struct ParseErrorDisplay<'a> {
     err: &'a ParseError,
 }
-impl fmt::Display for ParseErrorDisplay<'_> {
+impl<'a> fmt::Display for ParseErrorDisplay<'a> {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let style = Style::new().fg_color(Some(INFORM_ERR_COLOR)).bold();
@@ -535,7 +629,7 @@ impl fmt::Display for ParseErrorDisplay<'_> {
 }
 
 #[inline]
-pub(super) fn run_shell(py: Python<'_>, mut init_cmds: Vec<String>) -> Result<(), ExecErr> {
+pub(super) fn run_shell(py: Python<'_>, init_cmds: &str) -> Result<(), ExecErr> {
     let mut rl = Editor::<MyHelper, DefaultHistory>::new(MyHelper::new())?;
     _ = rl.bind_sequence(
         KeyEvent(KeyCode::Tab, Modifiers::NONE),
@@ -550,22 +644,24 @@ pub(super) fn run_shell(py: Python<'_>, mut init_cmds: Vec<String>) -> Result<()
         EventHandler::Simple(Cmd::Newline),
     );
     let mut terminate_count: u8 = 0;
+    let mut is_init = true;
     loop {
-        let input = if let Some(input) = init_cmds.pop() {
-            let helper = rl.helper_mut();
-            helper.update_after_edit(&input, 0, true);
-            DisplayOnce::print(helper.highlight_prompt(PROMPT1, true))?;
-            DisplayOnce::print(helper.highlight(&input, 0))?;
-            println!();
-            input
-        } else {
-            match rl.readline(PROMPT1) {
+        let (is_expr, input) = {
+            match if is_init {
+                is_init = false;
+                rl.readline_with_initial(PROMPT1, (init_cmds, ""))
+            } else {
+                rl.readline(PROMPT1)
+            } {
                 Ok(input) => input,
                 Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
                     if terminate_count >= TERMINATE_N {
                         return Ok(());
                     }
-                    println!("Need {} interrupt to exit..", TERMINATE_N - terminate_count);
+                    println!(
+                        "\nNeed {} interrupt to exit..",
+                        TERMINATE_N - terminate_count
+                    );
                     terminate_count += 1;
                     continue;
                 }
@@ -588,53 +684,25 @@ pub(super) fn run_shell(py: Python<'_>, mut init_cmds: Vec<String>) -> Result<()
         }
         terminate_count = 0;
         rl.helper_mut().exec_error = false;
-        let (statements, expr) = match rl.helper().parsed.syntax() {
-            Mod::Module(module) => {
-                let len = module.body.len();
-                match len {
-                    0 => (None, None),
-                    1 => {
-                        if let Stmt::Expr(_) = &module.body[len - 1] {
-                            (None, Some(input.as_str()))
-                        } else {
-                            (Some(input.as_str()), None)
-                        }
-                    }
-                    _ => {
-                        if let Stmt::Expr(expr) = &module.body[len - 1] {
-                            (
-                                Some(&input[0..expr.range.start().to_usize()]),
-                                Some(&input[expr.range]),
-                            )
-                        } else {
-                            (Some(input.as_str()), None)
-                        }
-                    }
-                }
-            }
-            Mod::Expression(expr) => (None, Some(&input[expr.range])),
-        };
-        if let Some(statements) = statements {
-            let code = CString::new(statements).unwrap();
-            if let Err(err) = py.run(code.as_c_str(), None, None) {
-                ErrDisplay { py, err }.report()?;
-                rl.helper_mut().exec_error = true;
-                _ = rl.add_history_entry(input)?;
-                continue;
-            }
-        }
-        if let Some(expr) = expr {
-            let expr = CString::new(expr).unwrap();
-            match py.eval(expr.as_c_str(), None, None) {
+        let code = CString::new(input.as_str()).unwrap();
+        if is_expr {
+            match py.eval(&code, None, None) {
                 Ok(res) => {
                     if !res.is_none() {
                         println!("{res}");
                     }
                 }
                 Err(err) => {
+                    rl.need_input();
                     ErrDisplay { py, err }.report()?;
                     rl.helper_mut().exec_error = true;
                 }
+            }
+        } else {
+            if let Err(err) = py.run(&code, None, None) {
+                rl.need_input();
+                ErrDisplay { py, err }.report()?;
+                rl.helper_mut().exec_error = true;
             }
         }
         _ = rl.add_history_entry(input)?;
@@ -645,13 +713,13 @@ struct ErrDisplay<'py> {
     py: Python<'py>,
     err: PyErr,
 }
-impl ErrDisplay<'_> {
+impl<'py> ErrDisplay<'py> {
     fn report(&self) -> Result<(), ExitCode> {
         let value = self.err.value(self.py);
         struct ErrDisplayInner<'py, 'a> {
             value: &'a Bound<'py, PyBaseException>,
         }
-        impl fmt::Display for ErrDisplayInner<'_, '_> {
+        impl<'py, 'a> fmt::Display for ErrDisplayInner<'py, 'a> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 let style = Style::new().fg_color(Some(INFORM_ERR_COLOR)).bold();
                 let msg_style = Style::new().fg_color(Some(INFORM_ERR_COLOR));
@@ -713,8 +781,8 @@ fn run_module(py: Python<'_>, modele_name: &str) -> Result<(), ExecErr> {
 
 #[inline]
 fn run_command(py: Python<'_>, cmd: &str) -> Result<(), ExecErr> {
-    py.run(CString::new(cmd).unwrap().as_c_str(), None, None)
-        .map_err(Into::into)
+    let code = CString::new(cmd).unwrap();
+    py.run(&code, None, None).map_err(Into::into)
 }
 
 #[inline]
@@ -722,13 +790,14 @@ fn exec_file(py: Python<'_>, file_path: &str) -> Result<(), ExecErr> {
     struct Lines<'s> {
         input: &'s str,
     }
-    impl fmt::Display for Lines<'_> {
+    impl<'s> fmt::Display for Lines<'s> {
         #[inline]
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             let mut iter = self.input.split('\n');
             if let Some(first_line) = iter.next() {
                 write!(f, "{PROMPT1}{}", first_line)?;
-                iter.try_for_each(|line| write!(f, "\n{PROMPT2}{line}"))?;
+                iter.map(|line| write!(f, "{PROMPT2}{line}"))
+                    .collect::<fmt::Result>()?;
             }
             Ok(())
         }
@@ -742,48 +811,30 @@ fn exec_file(py: Python<'_>, file_path: &str) -> Result<(), ExecErr> {
         println!("{}", ParseErrorDisplay { err: error });
         return Err(ExecErr::ParseError);
     }
-    match parsed.syntax() {
-        Mod::Module(module) => {
-            for body in &module.body {
-                let range = body.range();
-                let input = &buf[range];
-                let code = CString::new(input).unwrap();
-                let code = code.as_c_str();
-                println!("{}", Lines { input });
-                if let Stmt::Expr(_) = body {
-                    let res = py.eval(code, None, None)?;
-                    if !res.is_none() {
-                        println!("{res}");
-                    }
-                } else {
-                    py.run(code, None, None)?;
-                }
-            }
-        }
-        Mod::Expression(expr) => {
-            let input = &buf[expr.range];
-            let code = CString::new(input).unwrap();
-            let code = code.as_c_str();
-            println!("{}", Lines { input });
-            let res = py.eval(code, None, None)?;
+    for (is_expr, range) in segments(&parsed) {
+        let input = &buf[range];
+        let code = CString::new(input).unwrap();
+        println!("{}", Lines { input });
+        if is_expr {
+            let res = py.eval(&code, None, None)?;
             if !res.is_none() {
                 println!("{res}");
             }
+        } else {
+            _ = py.run(&code, None, None)?;
         }
-    };
+    }
     Ok(())
 }
 
 #[inline]
 fn quiet_exec_file(py: Python<'_>, file_path: &str) -> Result<(), ExecErr> {
-    let mut file = File::open(file_path)?;
-    let mut buf = String::new();
-    _ = file.read_to_string(&mut buf)?;
-    py.run(CString::new(buf.as_str()).unwrap().as_c_str(), None, None)?;
+    let bytes = std::fs::read(file_path)?;
+    let code = CString::new(bytes).unwrap();
+    py.run(&code, None, None)?;
     Ok(())
 }
 
-// generate by GPT
 fn print_error_lines(input: &str, file_path: &str, error_location: TextRange) {
     struct LineInfo<'a> {
         content: &'a str,
@@ -829,7 +880,7 @@ fn print_error_lines(input: &str, file_path: &str, error_location: TextRange) {
         let last_line = last_line.unwrap_or(0);
         (first_line, last_line)
     }
-    #[expect(clippy::needless_range_loop)]
+
     fn print_highlighted_lines(
         file_path: &str,
         lines: &[LineInfo<'_>],
@@ -855,7 +906,6 @@ fn print_error_lines(input: &str, file_path: &str, error_location: TextRange) {
             let mut highlight = vec![' '; line_len];
             let intersection_start = start.max(line_info.start_offset);
             let intersection_end = end.min(line_info.end_offset);
-
             if intersection_end > intersection_start {
                 let rel_start = intersection_start - line_info.start_offset;
                 let rel_end = intersection_end - line_info.start_offset;
